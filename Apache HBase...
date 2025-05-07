@@ -1,0 +1,143 @@
+import happybase
+import pandas as pd
+from datetime import datetime
+from collections import Counter
+import numpy as np
+
+# Bloque principal de ejecución
+try:
+    # 1. Establecer conexión con HBase
+    connection = happybase.Connection('localhost')
+    print("Conexión establecida con HBase")
+
+    # 2. Crear la tabla con las familias de columnas
+    table_name = 'titanic_passengers_analysis_extended'
+    families = {
+        'passenger': dict(),       # Información del pasajero
+        'ticket_cabin': dict()      # Información de ticket y cabina
+    }
+
+    # Eliminar la tabla si ya existe
+    if table_name.encode() in connection.tables():
+        print(f"Eliminando tabla existente - {table_name}")
+        connection.delete_table(table_name, disable=True)
+
+    # Crear nueva tabla
+    connection.create_table(table_name, families)
+    table = connection.table(table_name)
+    print(f"Tabla '{table_name}' creada exitosamente")
+
+    # 3. Cargar datos del CSV y preprocesar para HBase
+    titanic_data = pd.read_csv('titanic.csv')
+
+    # Calcular el promedio de edad para imputar valores faltantes o no enteros
+    valid_ages = titanic_data['Age'].dropna()
+    valid_ages = valid_ages[pd.to_numeric(valid_ages, errors='coerce').notna()]
+    average_age = valid_ages.mean() if not valid_ages.empty else 0
+
+    for index, row in titanic_data.iterrows():
+        row_key = f'passenger_{row["PassengerId"]}'.encode()
+        age_value = row['Age']
+        if pd.isna(age_value) or not str(age_value).replace('.', '', 1).isdigit():
+            age_to_store = str(average_age).encode()
+        else:
+            age_to_store = str(age_value).encode()
+
+        data = {
+            b'passenger:survived': str(row['Survived']).encode(),
+            b'passenger:pclass': str(row['Pclass']).encode(),
+            b'passenger:name': str(row['Name']).encode(),
+            b'passenger:sex': str(row['Sex']).encode(),
+            b'passenger:age': age_to_store,
+            b'passenger:sibsp': str(row['SibSp']).encode(),
+            b'passenger:parch': str(row['Parch']).encode(),
+            b'passenger:embarked': str(row['Embarked']).encode(),
+            b'ticket_cabin:ticket': str(row['Ticket']).encode(),
+            b'ticket_cabin:fare': str(row['Fare']).encode(),
+            b'ticket_cabin:cabin': str(row['Cabin']).encode()
+        }
+        table.put(row_key, data)
+
+    print("Todos los datos del Titanic cargados en HBase, edad preprocesada.")
+
+    # 4. Análisis de datos desde HBase
+    survived_count = 0
+    deceased_count = 0
+    male_count = 0
+    female_count = 0
+    total_age = 0
+    valid_age_count = 0
+    fares = []
+    male_survivors = 0
+    female_survivors = 0
+    min_fare = float('inf')
+    max_fare = float('-inf')
+
+    for key, data in table.scan():
+        try:
+            survived = int(data[b'passenger:survived'].decode())
+            sex = data[b'passenger:sex'].decode()
+            age_str = data.get(b'passenger:age', b'').decode()
+            fare_str = data.get(b'ticket_cabin:fare', b'').decode()
+
+            if survived == 1:
+                survived_count += 1
+                if sex == 'male':
+                    male_survivors += 1
+                elif sex == 'female':
+                    female_survivors += 1
+            else:
+                deceased_count += 1
+
+            if sex == 'male':
+                male_count += 1
+            elif sex == 'female':
+                female_count += 1
+
+            if age_str:
+                try:
+                    age = float(age_str)
+                    total_age += age
+                    valid_age_count += 1
+                except ValueError:
+                    pass  # Aunque ahora todas las edades deberían ser numéricas
+
+            if fare_str:
+                try:
+                    fare = float(fare_str)
+                    fares.append(fare)
+                    min_fare = min(min_fare, fare)
+                    max_fare = max(max_fare, fare)
+                except ValueError:
+                    pass  # Ignorar valores de tarifa no válidos
+
+        except KeyError as e:
+            print(f"Advertencia: Falta la columna {e} para el pasajero {key.decode()}")
+        except ValueError:
+            print(f"Advertencia: Error al convertir un valor para el pasajero {key.decode()}")
+
+    # Calcular el promedio de edad (ahora debería ser más robusto)
+    average_age_calculated = total_age / valid_age_count if valid_age_count > 0 else 0
+
+    # Calcular la moda del precio del ticket
+    fare_counts = Counter(fares)
+    most_common_fare = fare_counts.most_common(1)[0][0] if fare_counts else None
+
+    # Mostrar los resultados del análisis
+    print("\n=== Análisis Extendido de Pasajeros del Titanic ===")
+    print(f"Número de sobrevivientes: {survived_count}")
+    print(f"Número de fallecidos: {deceased_count}")
+    print(f"Número de hombres: {male_count}")
+    print(f"Número de mujeres: {female_count}")
+    print(f"Promedio de edad de los pasajeros: {average_age_calculated:.2f}")
+    print(f"Moda del precio del ticket: {most_common_fare}")
+    print(f"Número de sobrevivientes hombres: {male_survivors}")
+    print(f"Número de sobrevivientes mujeres: {female_survivors}")
+    print(f"Precio mínimo del pasaje: {min_fare:.2f}")
+    print(f"Precio máximo del pasaje: {max_fare:.2f}")
+
+except Exception as e:
+    print(f"Error: {str(e)}")
+finally:
+    # Cerrar la conexión
+    connection.close()
